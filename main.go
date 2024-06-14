@@ -58,6 +58,8 @@ type RaftPeer struct {
 	candidateId string
 	timerFn     func() // election timer
 
+	logger zerolog.Logger
+
 	sync.RWMutex
 }
 
@@ -98,14 +100,14 @@ func (server *RaftPeer) _setRole(role Role) {
 
 func (server *RaftPeer) _resetElectionTimer() {
 	server.timerFn() // cancel any running timers
-	min := 1500
-	max := 3000
+	min := 3000
+	max := 5000
 	electionTimeout := rand.Intn(max-min+1) + min
 	server.timerFn = CreateTimeoutCallback(electionTimeout, func() {
 		server.Lock()
 		defer server.Unlock()
 
-		log.Print("Election timeout... Starting new election as a Candidate")
+		server.logger.Print("Election timeout... Starting new election as a Candidate")
 		server._setRole(CANDIDATE)
 	})
 }
@@ -119,7 +121,7 @@ func (server *RaftPeer) Start(port string) {
 
 	// artificial sleep so that we get enough time to start rest of the nodes
 	time.Sleep(5 * time.Second)
-	log.Print("Starting Raft Control...")
+	server.logger.Print("Starting Raft Control...")
 	server._resetElectionTimer()
 
 	for {
@@ -127,13 +129,13 @@ func (server *RaftPeer) Start(port string) {
 		case role := <-server.roleUpdate:
 			switch role {
 			case LEADER:
-				log.Print("Role change to LEADER")
+				server.logger.Print("Role change to LEADER")
 				go server.leader()
 			case CANDIDATE:
-				log.Print("Role change to CANDIDATE")
+				server.logger.Print("Role change to CANDIDATE")
 				go server.candidate()
 			case FOLLOWER:
-				log.Print("Role change to FOLLOWER")
+				server.logger.Print("Role change to FOLLOWER")
 				server.follower()
 			}
 		default:
@@ -141,7 +143,7 @@ func (server *RaftPeer) Start(port string) {
 			if server.commitIndex > server.lastApplied {
 				server.lastApplied++
 				// todo: apply log to the state machine
-				log.Print("Apply log entry " + server.log[server.lastApplied].data)
+				server.logger.Print("Apply log entry " + server.log[server.lastApplied].data)
 			}
 		}
 	}
@@ -154,7 +156,7 @@ func (server *RaftPeer) leader() {
 		server._resetElectionTimer()
 		server.Unlock()
 
-		log.Print("Sending heartbeat to peers")
+		server.logger.Print("Sending heartbeat to peers")
 		server.appendEntries([]LogEntry{})
 		time.Sleep(1000 * time.Millisecond)
 	}
@@ -197,7 +199,7 @@ func (server *RaftPeer) requestVotes() {
 			}
 			response, err := sendRequestVote(node, request)
 			if err != nil {
-				log.Error().Str("Peer", node.candidateId).Err(err).Msg("Error while sending RequestVote RPC to Peer")
+				server.logger.Error().Str("Peer", node.candidateId).Err(err).Msg("Error while sending RequestVote RPC to Peer")
 				return
 			}
 			respChan <- response
@@ -212,7 +214,7 @@ func (server *RaftPeer) requestVotes() {
 			server.Lock()
 			server.currentTerm = resp.Term
 			server._setRole(FOLLOWER)
-			log.Print("Received higher term from node, change to FOLLOWER")
+			server.logger.Print("Received higher term from node, change to FOLLOWER")
 			server.Unlock()
 			return
 		}
@@ -220,14 +222,14 @@ func (server *RaftPeer) requestVotes() {
 		// if vote granted, increment vote
 		if resp.VoteGranted {
 			votes++
-			log.Printf("Votes: %d/%d", votes, len(server.nodes))
+			server.logger.Printf("Votes: %d/%d", votes, len(server.nodes))
 		}
 
 		if votes > len(server.nodes)/2 {
 			// majority, change to LEADER
 			server.Lock()
 			server._setRole(LEADER)
-			log.Print("Received majority votes, change to LEADER")
+			server.logger.Print("Received majority votes, change to LEADER")
 			server.Unlock()
 			return
 		}
@@ -287,7 +289,7 @@ func (server *RaftPeer) appendEntries(entries []LogEntry) {
 			}
 			response, err := sendAppendEntries(node, request)
 			if err != nil {
-				log.Error().Err(err).Str("Peer", node.candidateId).Msg("Error while sending AppendEntries RPC to Peer")
+				server.logger.Error().Err(err).Str("Peer", node.candidateId).Msg("Error while sending AppendEntries RPC to Peer")
 				return
 			}
 			respChan <- response
@@ -297,7 +299,7 @@ func (server *RaftPeer) appendEntries(entries []LogEntry) {
 	// gather responses
 	responded := 1
 	for resp := range respChan {
-		log.Print("Received response from node: ", responded, ":", resp.Success)
+		server.logger.Print("Received response from node: ", responded, ":", resp.Success)
 		responded++
 	}
 }
@@ -328,7 +330,7 @@ func (server *RaftPeer) requestVoteHandler() http.HandlerFunc {
 		var request RequestVoteRequest
 		err := json.NewDecoder(r.Body).Decode(&request)
 		if err != nil {
-			log.Error().Err(err).Msg("Error while decoding RequestVote request")
+			server.logger.Error().Err(err).Msg("Error while decoding RequestVote request")
 			http.Error(w, "Error while decoding request", http.StatusBadRequest)
 			return
 		}
@@ -336,7 +338,7 @@ func (server *RaftPeer) requestVoteHandler() http.HandlerFunc {
 		response := server.handleRequestVote(request)
 		jsonData, err := json.Marshal(response)
 		if err != nil {
-			log.Error().Err(err).Msg("Error while encoding RequestVote response")
+			server.logger.Error().Err(err).Msg("Error while encoding RequestVote response")
 			http.Error(w, "Error while encoding response", http.StatusInternalServerError)
 			return
 		}
@@ -351,7 +353,7 @@ func (server *RaftPeer) appendEntriesHandler() http.HandlerFunc {
 		var request AppendEntriesRequest
 		err := json.NewDecoder(r.Body).Decode(&request)
 		if err != nil {
-			log.Error().Err(err).Msg("Error while decoding AppendEntries request")
+			server.logger.Error().Err(err).Msg("Error while decoding AppendEntries request")
 			http.Error(w, "Error while decoding request", http.StatusBadRequest)
 			return
 		}
@@ -359,7 +361,7 @@ func (server *RaftPeer) appendEntriesHandler() http.HandlerFunc {
 		response := server.handleAppendEntries(request)
 		jsonData, err := json.Marshal(response)
 		if err != nil {
-			log.Error().Err(err).Msg("Error while encoding AppendEntries response")
+			server.logger.Error().Err(err).Msg("Error while encoding AppendEntries response")
 			http.Error(w, "Error while encoding response", http.StatusInternalServerError)
 			return
 		}
@@ -376,7 +378,7 @@ func (server *RaftPeer) pingHandler() http.HandlerFunc {
 }
 
 func (server *RaftPeer) handleRequestVote(request RequestVoteRequest) RequestVoteResponse {
-	log.Print("Received RequestVote from " + request.CandidateId)
+	server.logger.Print("Received RequestVote from " + request.CandidateId)
 
 	server.Lock()
 	server._resetElectionTimer()
@@ -416,7 +418,7 @@ func (server *RaftPeer) handleAppendEntries(request AppendEntriesRequest) Append
 	server.Lock()
 	defer server.Unlock()
 
-	log.Print("Received AppendEntries request from " + request.LeaderId)
+	server.logger.Print("Received AppendEntries request from " + request.LeaderId)
 	server._resetElectionTimer()
 
 	response := AppendEntriesResponse{
@@ -426,12 +428,12 @@ func (server *RaftPeer) handleAppendEntries(request AppendEntriesRequest) Append
 
 	// if request term less, reject
 	if request.Term < server.currentTerm {
-		log.Print("Request term is less than current term")
+		server.logger.Print("Request term is less than current term")
 		return response
 	}
 
 	if len(server.log) <= int(request.PrevLogIndex) || server.log[request.PrevLogIndex].term != request.PrevLogTerm {
-		log.
+		server.logger.
 			Info().
 			Bool("len long is lt prevLI", len(server.log) <= int(request.PrevLogIndex)).
 			Bool("prevLI term match req prevLogTerm", server.log[request.PrevLogIndex].term != request.PrevLogTerm).
@@ -452,6 +454,30 @@ func (server *RaftPeer) handleAppendEntries(request AppendEntriesRequest) Append
 
 	response.Term = server.currentTerm
 	return response
+}
+
+func (role Role) String() string {
+	switch role {
+	case LEADER:
+		return "LEADER"
+	case FOLLOWER:
+		return "FOLLOWER"
+	case CANDIDATE:
+		return "CANDIDATE"
+	default:
+		return "UNKNOWN"
+	}
+}
+
+type ServerHook struct {
+	*RaftPeer
+}
+
+func (h *ServerHook) Run(e *zerolog.Event, l zerolog.Level, msg string) {
+	e.Int("term", int(h.currentTerm))
+	e.Str("role", h.role.String())
+	e.Str("candidateId", h.candidateId)
+	e.Str("votedFor", h.votedFor)
 }
 
 func main() {
@@ -484,7 +510,7 @@ func main() {
 	}
 
 	// add candidate ids to the config
-	for idx, _ := range config {
+	for idx := range config {
 		node := config[idx]
 		config[idx].candidateId = fmt.Sprintf("%s:%s", node.host, node.port)
 	}
@@ -508,6 +534,11 @@ func main() {
 	}
 	server.log[0].term = 0
 
-	log.Print("Staring Raft server with candidate id " + server.candidateId)
+	serverHook := ServerHook{
+		&server,
+	}
+	server.logger = zerolog.New(os.Stdout).Hook(&serverHook)
+
+	server.logger.Print("Staring Raft server with candidate id " + server.candidateId)
 	server.Start(port)
 }
